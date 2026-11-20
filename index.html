@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NIFTY Option Pre-Trade Checklist (Auto-Sync Ready)</title>
+  <title>NIFTY Option Pre-Trade Checklist (Weekly &amp; Monthly Expiry Sync)</title>
   <style>
     :root {
       --bg-primary: #0b0f19;
@@ -73,7 +73,11 @@
     }
 
     button:hover { border-color: var(--accent); }
-    button.active { background: rgba(56, 189, 248, 0.16); border-color: var(--accent); color: var(--accent); }
+    button.active {
+      background: rgba(56, 189, 248, 0.16);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
 
     .grid {
       display: grid;
@@ -93,6 +97,7 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 8px;
       margin-bottom: 12px;
       padding-bottom: 10px;
       border-bottom: 1px solid var(--border);
@@ -105,6 +110,7 @@
       font-weight: 700;
       background: var(--bg-elevated);
       color: var(--text-muted);
+      white-space: nowrap;
     }
 
     .badge.bull { background: var(--bull-bg); color: var(--bull); }
@@ -127,6 +133,78 @@
 
     .stat { font-size: 0.82rem; color: var(--text-muted); margin-top: 6px; }
     .stat strong { color: var(--text-main); }
+
+    /* Weekly vs Monthly Switcher & Side-by-Side Comparison */
+    .expiry-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .expiry-switch {
+      display: inline-flex;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 3px;
+      gap: 3px;
+    }
+
+    .expiry-switch button {
+      border: none;
+      background: transparent;
+      padding: 5px 10px;
+      font-size: 0.76rem;
+      border-radius: 6px;
+    }
+
+    .expiry-switch button.selected {
+      background: var(--accent);
+      color: #06101d;
+      font-weight: 700;
+    }
+
+    .expiry-compare {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .expiry-box {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font-size: 0.76rem;
+    }
+
+    .expiry-box.active-scope {
+      border-color: var(--accent);
+    }
+
+    .expiry-box-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+      font-weight: 700;
+    }
+
+    .mini-tag {
+      font-size: 0.68rem;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: var(--bg-primary);
+      color: var(--text-muted);
+    }
+
+    .mini-tag.bull { color: var(--bull); background: var(--bull-bg); }
+    .mini-tag.bear { color: var(--bear); background: var(--bear-bg); }
+    .mini-tag.avoid { color: var(--warn); background: var(--warn-bg); }
 
     .summary {
       background: var(--bg-card);
@@ -222,6 +300,32 @@
           <h3>3. Option Activity (Vol &amp; OI)</h3>
           <span class="badge" id="b3">—</span>
         </div>
+
+        <div class="expiry-bar">
+          <span class="stat" style="margin-top:0;">Active Scope: <strong id="activeScopeLabel">Weekly</strong></span>
+          <div class="expiry-switch" role="group" aria-label="Expiry Switcher">
+            <button type="button" id="btnWeekly" class="selected">Weekly</button>
+            <button type="button" id="btnMonthly">Monthly</button>
+          </div>
+        </div>
+
+        <div class="expiry-compare">
+          <div class="expiry-box active-scope" id="weeklyCard">
+            <div class="expiry-box-head">
+              <span>Weekly (<span id="weeklyExpDate">—</span>)</span>
+              <span class="mini-tag" id="weeklyTag">—</span>
+            </div>
+            <div id="weeklyDetail">No JSON data yet</div>
+          </div>
+          <div class="expiry-box" id="monthlyCard">
+            <div class="expiry-box-head">
+              <span>Monthly (<span id="monthlyExpDate">—</span>)</span>
+              <span class="mini-tag" id="monthlyTag">—</span>
+            </div>
+            <div id="monthlyDetail">No JSON data yet</div>
+          </div>
+        </div>
+
         <div class="row">
           <div class="field">
             <label>Most Active % Chg</label>
@@ -284,7 +388,7 @@
 
     <div class="summary">
       <div>
-        <div class="stat">Final Checklist Verdict</div>
+        <div class="stat">Final Checklist Verdict (<span id="verdictScope">Weekly</span>)</div>
         <div class="verdict" id="finalVerdict">WAITING FOR DATA</div>
       </div>
       <div class="stat" id="tallyText">Bullish: 0 | Bearish: 0 | Avoid: 0</div>
@@ -293,6 +397,8 @@
 
   <script>
     let autoSyncEnabled = true;
+    let selectedExpiry = "weekly";
+    let latestJsonData = null;
 
     setInterval(() => {
       document.getElementById("istClock").textContent =
@@ -320,6 +426,59 @@
       if (r > 1.15) return "bull";
       if (r < 0.87) return "bear";
       return "avoid";
+    }
+
+    function computeStep3FromMetrics(m) {
+      if (!m) return null;
+      if (m.atm_both_flag === "yes") return "avoid";
+      if (m.opt_vol && m.opt_oi) return m.opt_vol === m.opt_oi ? m.opt_vol : "avoid";
+      return m.opt_vol || m.opt_oi || null;
+    }
+
+    function renderExpiryComparison(data) {
+      const diag = (data && data.oc_diagnostics) || {};
+      const wk = diag.weekly || null;
+      const mo = diag.monthly || null;
+
+      weeklyExpDate.textContent = (wk && wk.expiry) || (data && data.weekly_expiry) || "—";
+      monthlyExpDate.textContent = (mo && mo.expiry) || (data && data.monthly_expiry) || "—";
+
+      const wkSig = computeStep3FromMetrics(wk);
+      const moSig = computeStep3FromMetrics(mo);
+
+      weeklyTag.className = "mini-tag" + (wkSig ? ` ${wkSig}` : "");
+      weeklyTag.textContent = wkSig ? wkSig.toUpperCase() : "—";
+
+      monthlyTag.className = "mini-tag" + (moSig ? ` ${moSig}` : "");
+      monthlyTag.textContent = moSig ? moSig.toUpperCase() : "—";
+
+      weeklyDetail.textContent = wk
+        ? `Vol: ${wk.opt_vol || "—"} | OI: ${wk.opt_oi || "—"} | ATM Both: ${wk.atm_both_flag || "no"}`
+        : "No weekly breakdown";
+
+      monthlyDetail.textContent = mo
+        ? `Vol: ${mo.opt_vol || "—"} | OI: ${mo.opt_oi || "—"} | ATM Both: ${mo.atm_both_flag || "no"}`
+        : "No monthly breakdown";
+    }
+
+    function applyExpiryScope(scope) {
+      selectedExpiry = scope;
+      const isWeekly = scope === "weekly";
+      btnWeekly.classList.toggle("selected", isWeekly);
+      btnMonthly.classList.toggle("selected", !isWeekly);
+      weeklyCard.classList.toggle("active-scope", isWeekly);
+      monthlyCard.classList.toggle("active-scope", !isWeekly);
+      activeScopeLabel.textContent = isWeekly ? "Weekly" : "Monthly";
+      verdictScope.textContent = isWeekly ? "Weekly" : "Monthly";
+
+      const diag = latestJsonData && latestJsonData.oc_diagnostics;
+      const chosen = diag && diag[scope];
+      if (chosen) {
+        optVol.value = chosen.opt_vol || "";
+        optOi.value = chosen.opt_oi || "";
+        atmBothFlag.value = chosen.atm_both_flag || "no";
+      }
+      evaluate();
     }
 
     function evaluate() {
@@ -401,6 +560,7 @@
         const res = await fetch(`./nse_data.json?t=${Date.now()}`, { cache: "no-store" });
         if (!res.ok) throw new Error("JSON not found");
         const d = await res.json();
+        latestJsonData = d;
 
         if (d.nse_adv != null) nseAdv.value = d.nse_adv;
         if (d.nse_dec != null) nseDec.value = d.nse_dec;
@@ -409,13 +569,24 @@
         if (d.sec_bank) secBank.value = d.sec_bank;
         if (d.sec_oil) secOil.value = d.sec_oil;
         if (d.sec_it) secIt.value = d.sec_it;
-        if (d.opt_vol) optVol.value = d.opt_vol;
-        if (d.opt_oi) optOi.value = d.opt_oi;
-        if (d.atm_both_flag) atmBothFlag.value = d.atm_both_flag;
         if (d.atm_chart) atmChart.value = d.atm_chart;
         if (d.high != null) nHigh.value = d.high;
         if (d.low != null) nLow.value = d.low;
         if (d.ltp != null) nLtp.value = d.ltp;
+
+        renderExpiryComparison(d);
+
+        const diag = d.oc_diagnostics || {};
+        const activeMetrics = diag[selectedExpiry];
+        if (activeMetrics) {
+          optVol.value = activeMetrics.opt_vol || "";
+          optOi.value = activeMetrics.opt_oi || "";
+          atmBothFlag.value = activeMetrics.atm_both_flag || "no";
+        } else {
+          if (d.opt_vol) optVol.value = d.opt_vol;
+          if (d.opt_oi) optOi.value = d.opt_oi;
+          if (d.atm_both_flag) atmBothFlag.value = d.atm_both_flag;
+        }
 
         syncMeta.textContent = `Auto-synced from nse_data.json • Updated: ${d.updated_at || "Just now"}`;
         evaluate();
@@ -424,6 +595,9 @@
         evaluate();
       }
     }
+
+    btnWeekly.addEventListener("click", () => applyExpiryScope("weekly"));
+    btnMonthly.addEventListener("click", () => applyExpiryScope("monthly"));
 
     document.querySelectorAll("input, select").forEach(el => {
       el.addEventListener("input", evaluate);
