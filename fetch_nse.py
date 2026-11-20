@@ -1,4 +1,6 @@
 import json
+import random
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
@@ -13,6 +15,8 @@ HEADERS = {
     "Referer": "https://www.nseindia.com/option-chain",
 }
 
+RETRYABLE_STATUS_CODES = {401, 403, 408, 425, 429, 500, 502, 503, 504}
+
 
 def pct_to_sig(pct_val):
     if pct_val is None:
@@ -22,6 +26,110 @@ def pct_to_sig(pct_val):
     if pct_val < -0.15:
         return "bear"
     return "flat"
+
+
+def to_int_or_none(val):
+    if val is None or val == "":
+        return None
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
+def warm_up_session(session):
+    """Refresh NSE session cookies by visiting the option-chain page."""
+    resp = session.get("https://www.nseindia.com/option-chain", timeout=15)
+    resp.raise_for_status()
+    time.sleep(random.uniform(0.8, 1.5))
+
+
+def request_with_retry(
+    session,
+    url,
+    max_retries=4,
+    base_delay=1.5,
+    max_delay=20.0,
+    timeout=15,
+    expect_json=True,
+):
+    """
+    Perform an HTTP GET with exponential backoff + jitter.
+    Re-warms NSE cookies on auth/rate-limit responses (401/403/429).
+    """
+    last_err = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = session.get(url, timeout=timeout)
+
+            if resp.status_code in RETRYABLE_STATUS_CODES:
+                raise requests.HTTPError(
+                    f"Retryable HTTP {resp.status_code} for {url}", response=resp
+                )
+
+            resp.raise_for_status()
+
+            if expect_json:
+                return resp.json()
+            return resp.text
+
+        except (requests.RequestException, ValueError) as err:
+            last_err = err
+            if attempt >= max_retries:
+                break
+
+            status = getattr(getattr(err, "response", None), "status_code", None)
+            if status in (401, 403, 429):
+                try:
+                    warm_up_session(session)
+                except requests.RequestException:
+                    pass
+
+            exp_wait = min(max_delay, base_delay * (2 ** attempt))
+            jitter = random.uniform(0.25, 0.85)
+            sleep_for = exp_wait + jitter
+            print(
+                f"[Retry {attempt + 1}/{max_retries}] {url} failed ({err}). "
+                f"Backing off {sleep_for:.2f}s..."
+            )
+            time.sleep(sleep_for)
+
+    raise RuntimeError(f"Failed to fetch {url} after {max_retries + 1} attempts") from last_err
+
+
+def extract_overall_nse_breadth(session, all_ind_json):
+    """
+    Attempt to retrieve overall NSE market advancing and declining counts.
+    Tries broad market indices/endpoints first and falls back gracefully.
+    """
+    for item in all_ind_json.get("data", []):
+        idx_name = (item.get("index") or "").upper()
+        if idx_name in ("NIFTY TOTAL MARKET", "ALL", "NIFTY 500"):
+            adv = to_int_or_none(item.get("advances"))
+            dec = to_int_or_none(item.get("declines"))
+            if adv is not None and dec is not None:
+                return adv, dec
+
+    for idx_query in ("NIFTY%20500", "SECURITIES%20IN%20F%26O"):
+        try:
+            time.sleep(random.uniform(0.6, 1.2))
+            payload = request_with_retry(
+                session,
+                f"https://www.nseindia.com/api/equity-stockIndices?index={idx_query}",
+                max_retries=2,
+                base_delay=1.0,
+                timeout=12,
+            )
+            adv_obj = payload.get("advance") or {}
+            adv = to_int_or_none(adv_obj.get("advances"))
+            dec = to_int_or_none(adv_obj.get("declines"))
+            if adv is not None and dec is not None:
+                return adv, dec
+        except Exception:
+            continue
+
+    return None, None
 
 
 def parse_nse_expiry(exp_str):
@@ -41,7 +149,6 @@ def resolve_expiries(records, today_ist):
         if dt and dt >= today_ist:
             parsed.append((dt, s))
 
-    # Fallback: collect unique expiry strings from records.data if expiryDates is empty
     if not parsed:
         seen = set()
         for r in records.get("data", []):
@@ -58,14 +165,19 @@ def resolve_expiries(records, today_ist):
 
     nearest_weekly_dt, nearest_weekly_str = parsed[0]
 
-    # Monthly expiry is typically the final expiry of the month
-    same_month = [item for item in parsed if item[0].year == nearest_weekly_dt.year and item[0].month == nearest_weekly_dt.month]
+    same_month = [
+        item for item in parsed
+        if item[0].year == nearest_weekly_dt.year and item[0].month == nearest_weekly_dt.month
+    ]
     if same_month:
-        monthly_dt, monthly_str = same_month[-1]
+        _, monthly_str = same_month[-1]
     else:
         next_month_dt = parsed[-1][0]
-        next_month_items = [item for item in parsed if item[0].year == next_month_dt.year and item[0].month == next_month_dt.month]
-        monthly_dt, monthly_str = next_month_items[-1]
+        next_month_items = [
+            item for item in parsed
+            if item[0].year == next_month_dt.year and item[0].month == next_month_dt.month
+        ]
+        _, monthly_str = next_month_items[-1]
 
     return nearest_weekly_str, monthly_str
 
@@ -188,15 +300,35 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    session.get("https://www.nseindia.com/option-chain", timeout=12)
+    request_with_retry(
+        session,
+        "https://www.nseindia.com/option-chain",
+        max_retries=3,
+        base_delay=1.5,
+        timeout=15,
+        expect_json=False,
+    )
+    time.sleep(random.uniform(0.8, 1.5))
 
-    all_ind = session.get("https://www.nseindia.com/api/allIndices", timeout=12).json()
-    nifty_eq = session.get(
-        "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050", timeout=12
-    ).json()
-    oc_data = session.get(
-        "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY", timeout=12
-    ).json()
+    all_ind = request_with_retry(
+        session, "https://www.nseindia.com/api/allIndices", timeout=15
+    )
+    time.sleep(random.uniform(0.7, 1.3))
+
+    nifty_eq = request_with_retry(
+        session,
+        "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050",
+        timeout=15,
+    )
+    time.sleep(random.uniform(0.7, 1.3))
+
+    oc_data = request_with_retry(
+        session,
+        "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
+        timeout=15,
+    )
+
+    nse_adv, nse_dec = extract_overall_nse_breadth(session, all_ind)
 
     indices_by_name = {item.get("index"): item for item in all_ind.get("data", [])}
     nifty_meta = nifty_eq.get("metadata", {})
@@ -220,10 +352,10 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
         "expiry_scope": primary_expiry,
         "weekly_expiry": oc_analysis["weekly"]["expiry"],
         "monthly_expiry": oc_analysis["monthly"]["expiry"],
-        "nse_adv": None,
-        "nse_dec": None,
-        "nifty_adv": int(adv_dec.get("advances", 0)),
-        "nifty_dec": int(adv_dec.get("declines", 0)),
+        "nse_adv": nse_adv,
+        "nse_dec": nse_dec,
+        "nifty_adv": to_int_or_none(adv_dec.get("advances")),
+        "nifty_dec": to_int_or_none(adv_dec.get("declines")),
         "sec_bank": pct_to_sig(bank_item.get("percentChange")),
         "sec_oil": pct_to_sig(oil_item.get("percentChange")),
         "sec_it": pct_to_sig(it_item.get("percentChange")),
@@ -244,7 +376,8 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
         json.dump(payload, f, indent=2)
 
     print(
-        f"Updated nse_data.json ({primary_expiry} -> W:{payload['weekly_expiry']} | M:{payload['monthly_expiry']}) at {payload['updated_at']}"
+        f"Updated nse_data.json | Overall A/D: {nse_adv}/{nse_dec} | "
+        f"NIFTY A/D: {payload['nifty_adv']}/{payload['nifty_dec']} at {payload['updated_at']}"
     )
 
 
