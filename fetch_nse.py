@@ -5,6 +5,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
+BASE_URL = "https://www.nseindia.in"
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -12,13 +14,14 @@ HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/option-chain",
+    "Referer": f"{BASE_URL}/option-chain",
+    "Origin": BASE_URL,
     "Sec-Fetch-Site": "same-origin",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Dest": "empty",
 }
 
-RETRYABLE_STATUS_CODES = {401, 403, 404, 408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {401, 403, 408, 425, 429, 500, 502, 503, 504}
 
 
 def pct_to_sig(pct_val):
@@ -41,8 +44,8 @@ def to_int_or_none(val):
 
 
 def warm_up_session(session):
-    """Refresh NSE session cookies on nseindia.com."""
-    resp = session.get("https://www.nseindia.com/option-chain", timeout=15, allow_redirects=True)
+    """Refresh NSE session cookies on nseindia.in."""
+    resp = session.get(f"{BASE_URL}/option-chain", timeout=15, allow_redirects=True)
     resp.raise_for_status()
     time.sleep(random.uniform(0.8, 1.5))
 
@@ -58,25 +61,17 @@ def request_with_retry(
 ):
     """
     Perform an HTTP GET with exponential backoff + jitter.
-    Re-warms NSE cookies on auth/rate-limit/redirect responses.
+    Re-warms NSE cookies on auth/rate-limit responses.
     """
     last_err = None
 
     for attempt in range(max_retries + 1):
         try:
-            resp = session.get(url, timeout=timeout, allow_redirects=False)
-
-            # Guard against redirects to nseindia.in or login pages
-            if resp.is_redirect or resp.is_permanent_redirect:
-                loc = resp.headers.get("Location", "")
-                raise requests.HTTPError(
-                    f"Unexpected redirect ({resp.status_code} -> {loc}) for {url}",
-                    response=resp,
-                )
+            resp = session.get(url, timeout=timeout, allow_redirects=True)
 
             if resp.status_code in RETRYABLE_STATUS_CODES:
                 raise requests.HTTPError(
-                    f"Retryable HTTP {resp.status_code} for {url}", response=resp
+                    f"Retryable HTTP {resp.status_code} for {resp.url}", response=resp
                 )
 
             resp.raise_for_status()
@@ -90,10 +85,12 @@ def request_with_retry(
             if attempt >= max_retries:
                 break
 
-            try:
-                warm_up_session(session)
-            except requests.RequestException:
-                pass
+            status = getattr(getattr(err, "response", None), "status_code", None)
+            if status in (401, 403, 429):
+                try:
+                    warm_up_session(session)
+                except requests.RequestException:
+                    pass
 
             exp_wait = min(max_delay, base_delay * (2 ** attempt))
             jitter = random.uniform(0.25, 0.85)
@@ -121,7 +118,7 @@ def extract_overall_nse_breadth(session, all_ind_json):
             time.sleep(random.uniform(0.6, 1.2))
             payload = request_with_retry(
                 session,
-                f"https://www.nseindia.com/api/equity-stockIndices?index={idx_query}",
+                f"{BASE_URL}/api/equity-stockIndices?index={idx_query}",
                 max_retries=2,
                 base_delay=1.0,
                 timeout=12,
@@ -308,20 +305,20 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
     warm_up_session(session)
 
     all_ind = request_with_retry(
-        session, "https://www.nseindia.com/api/allIndices", timeout=15
+        session, f"{BASE_URL}/api/allIndices", timeout=15
     )
     time.sleep(random.uniform(0.7, 1.3))
 
     nifty_eq = request_with_retry(
         session,
-        "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050",
+        f"{BASE_URL}/api/equity-stockIndices?index=NIFTY%2050",
         timeout=15,
     )
     time.sleep(random.uniform(0.7, 1.3))
 
     oc_data = request_with_retry(
         session,
-        "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
+        f"{BASE_URL}/api/option-chain-indices?symbol=NIFTY",
         timeout=15,
     )
 
