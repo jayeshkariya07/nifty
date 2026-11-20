@@ -58,6 +58,7 @@ def request_with_retry(
     max_delay=20.0,
     timeout=15,
     expect_json=True,
+    allow_404=False,
 ):
     """
     Perform an HTTP GET with exponential backoff + jitter.
@@ -68,6 +69,10 @@ def request_with_retry(
     for attempt in range(max_retries + 1):
         try:
             resp = session.get(url, timeout=timeout, allow_redirects=True)
+
+            if allow_404 and resp.status_code == 404:
+                print(f"[Info] {url} returned 404; using fallback data.")
+                return None
 
             if resp.status_code in RETRYABLE_STATUS_CODES:
                 raise requests.HTTPError(
@@ -122,7 +127,10 @@ def extract_overall_nse_breadth(session, all_ind_json):
                 max_retries=2,
                 base_delay=1.0,
                 timeout=12,
+                allow_404=True,
             )
+            if not isinstance(payload, dict):
+                continue
             adv_obj = payload.get("advance") or {}
             adv = to_int_or_none(adv_obj.get("advances"))
             dec = to_int_or_none(adv_obj.get("declines"))
@@ -309,11 +317,18 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
     )
     time.sleep(random.uniform(0.7, 1.3))
 
-    nifty_eq = request_with_retry(
-        session,
-        f"{BASE_URL}/api/equity-stockIndices?index=NIFTY%2050",
-        timeout=15,
-    )
+    nifty_eq = None
+    try:
+        nifty_eq = request_with_retry(
+            session,
+            f"{BASE_URL}/api/equity-stockIndices?index=NIFTY%2050",
+            max_retries=2,
+            timeout=15,
+            allow_404=True,
+        )
+    except RuntimeError as err:
+        print(f"[Warn] equity-stockIndices failed ({err}); falling back to allIndices/option-chain.")
+
     time.sleep(random.uniform(0.7, 1.3))
 
     oc_data = request_with_retry(
@@ -325,17 +340,27 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
     nse_adv, nse_dec = extract_overall_nse_breadth(session, all_ind)
 
     indices_by_name = {item.get("index"): item for item in all_ind.get("data", [])}
-    nifty_meta = nifty_eq.get("metadata", {})
-    adv_dec = nifty_eq.get("advance", {})
+    nifty_eq = nifty_eq if isinstance(nifty_eq, dict) else {}
+    nifty_meta = nifty_eq.get("metadata") or {}
+    adv_dec = nifty_eq.get("advance") or {}
 
-    nifty_50_item = indices_by_name.get("NIFTY 50", {})
-    bank_item = indices_by_name.get("NIFTY BANK") or indices_by_name.get("NIFTY FIN SERVICE", {})
-    oil_item = indices_by_name.get("NIFTY OIL & GAS", {})
-    it_item = indices_by_name.get("NIFTY IT", {})
+    nifty_50_item = indices_by_name.get("NIFTY 50") or {}
+    bank_item = indices_by_name.get("NIFTY BANK") or indices_by_name.get("NIFTY FIN SERVICE") or {}
+    oil_item = indices_by_name.get("NIFTY OIL & GAS") or {}
+    it_item = indices_by_name.get("NIFTY IT") or {}
+
+    oc_underlying = (oc_data.get("records") or {}).get("underlyingValue")
 
     high_val = nifty_50_item.get("high") or nifty_meta.get("high")
     low_val = nifty_50_item.get("low") or nifty_meta.get("low")
-    ltp_val = nifty_50_item.get("last") or nifty_meta.get("lastPrice")
+    ltp_val = nifty_50_item.get("last") or nifty_meta.get("lastPrice") or oc_underlying
+
+    nifty_adv = to_int_or_none(adv_dec.get("advances"))
+    nifty_dec = to_int_or_none(adv_dec.get("declines"))
+    if nifty_adv is None:
+        nifty_adv = to_int_or_none(nifty_50_item.get("advances"))
+    if nifty_dec is None:
+        nifty_dec = to_int_or_none(nifty_50_item.get("declines"))
 
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
     oc_analysis = analyze_option_chain(oc_data, ltp_val, now_ist.date(), primary_expiry=primary_expiry)
@@ -348,8 +373,8 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
         "monthly_expiry": oc_analysis["monthly"]["expiry"],
         "nse_adv": nse_adv,
         "nse_dec": nse_dec,
-        "nifty_adv": to_int_or_none(adv_dec.get("advances")),
-        "nifty_dec": to_int_or_none(adv_dec.get("declines")),
+        "nifty_adv": nifty_adv,
+        "nifty_dec": nifty_dec,
         "sec_bank": pct_to_sig(bank_item.get("percentChange")),
         "sec_oil": pct_to_sig(oil_item.get("percentChange")),
         "sec_it": pct_to_sig(it_item.get("percentChange")),
@@ -371,7 +396,7 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
 
     print(
         f"Updated nse_data.json | Overall A/D: {nse_adv}/{nse_dec} | "
-        f"NIFTY A/D: {payload['nifty_adv']}/{payload['nifty_dec']} at {payload['updated_at']}"
+        f"NIFTY A/D: {nifty_adv}/{nifty_dec} at {payload['updated_at']}"
     )
 
 
