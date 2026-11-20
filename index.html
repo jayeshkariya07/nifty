@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NIFTY Option Pre-Trade Checklist (Auto-Sync Ready)</title>
+  <style>
+    :root {
+      --bg-primary: #0b0f19;
+      --bg-card: #131926;
+      --bg-elevated: #1b2333;
+      --border: #263147;
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --bull: #22c55e;
+      --bull-bg: rgba(34, 197, 94, 0.14);
+      --bear: #ef4444;
+      --bear-bg: rgba(239, 68, 68, 0.14);
+      --warn: #f59e0b;
+      --warn-bg: rgba(245, 158, 11, 0.14);
+      --accent: #38bdf8;
+      --radius: 12px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-main);
+      line-height: 1.5;
+      padding: 20px;
+    }
+
+    .container { max-width: 1240px; margin: 0 auto; }
+
+    header {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    header h1 { font-size: 1.2rem; font-weight: 700; }
+    header p { font-size: 0.82rem; color: var(--text-muted); }
+
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+    .pill-info {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    button {
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--bg-elevated);
+      color: var(--text-main);
+      padding: 7px 12px;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+
+    button:hover { border-color: var(--accent); }
+    button.active { background: rgba(56, 189, 248, 0.16); border-color: var(--accent); color: var(--accent); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+    }
+
+    .card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .badge {
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 0.74rem;
+      font-weight: 700;
+      background: var(--bg-elevated);
+      color: var(--text-muted);
+    }
+
+    .badge.bull { background: var(--bull-bg); color: var(--bull); }
+    .badge.bear { background: var(--bear-bg); color: var(--bear); }
+    .badge.avoid { background: var(--warn-bg); color: var(--warn); }
+
+    .row { display: flex; gap: 10px; margin-bottom: 10px; }
+    .field { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: 0.74rem; color: var(--text-muted); }
+
+    input, select {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 7px 9px;
+      border-radius: 7px;
+      font-size: 0.88rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stat { font-size: 0.82rem; color: var(--text-muted); margin-top: 6px; }
+    .stat strong { color: var(--text-main); }
+
+    .summary {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .verdict { font-size: 1.15rem; font-weight: 800; }
+    .verdict.bull { color: var(--bull); }
+    .verdict.bear { color: var(--bear); }
+    .verdict.avoid { color: var(--warn); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>NIFTY Option Pre-Trade Checklist</h1>
+        <p id="syncMeta">Waiting for nse_data.json (Manual editing also enabled)</p>
+      </div>
+      <div class="controls">
+        <div class="pill-info" id="istClock">--:--:-- IST</div>
+        <button type="button" id="syncNowBtn">Sync Now</button>
+        <button type="button" id="autoSyncBtn" class="active">Auto-Sync (60s): ON</button>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- Step 1 -->
+      <section class="card">
+        <div class="card-top">
+          <h3>1. Market Breadth (A/D)</h3>
+          <span class="badge" id="b1">—</span>
+        </div>
+        <div class="row">
+          <div class="field"><label>NSE Adv</label><input type="number" id="nseAdv" /></div>
+          <div class="field"><label>NSE Dec</label><input type="number" id="nseDec" /></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>NIFTY Adv</label><input type="number" id="nifAdv" /></div>
+          <div class="field"><label>NIFTY Dec</label><input type="number" id="nifDec" /></div>
+        </div>
+        <div class="stat">NSE Ratio: <strong id="nseRatio">—</strong> | NIFTY Ratio: <strong id="nifRatio">—</strong></div>
+      </section>
+
+      <!-- Step 2 -->
+      <section class="card">
+        <div class="card-top">
+          <h3>2. Heavyweight Sectors (~56%)</h3>
+          <span class="badge" id="b2">—</span>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Bank/Fin (37%)</label>
+            <select id="secBank">
+              <option value="">—</option>
+              <option value="bull">Green (+)</option>
+              <option value="flat">Flat</option>
+              <option value="bear">Red (-)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Oil &amp; Gas (10%)</label>
+            <select id="secOil">
+              <option value="">—</option>
+              <option value="bull">Green (+)</option>
+              <option value="flat">Flat</option>
+              <option value="bear">Red (-)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>IT (9%)</label>
+            <select id="secIt">
+              <option value="">—</option>
+              <option value="bull">Green (+)</option>
+              <option value="flat">Flat</option>
+              <option value="bear">Red (-)</option>
+            </select>
+          </div>
+        </div>
+        <div class="stat">Bull Weight: <strong id="wBull">0%</strong> | Bear Weight: <strong id="wBear">0%</strong></div>
+      </section>
+
+      <!-- Step 3 -->
+      <section class="card">
+        <div class="card-top">
+          <h3>3. Option Activity (Vol &amp; OI)</h3>
+          <span class="badge" id="b3">—</span>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Most Active % Chg</label>
+            <select id="optVol">
+              <option value="">—</option>
+              <option value="bull">Calls +%</option>
+              <option value="bear">Puts +%</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Most Active OI (Contra)</label>
+            <select id="optOi">
+              <option value="">—</option>
+              <option value="bull">More Puts OI</option>
+              <option value="bear">More Calls OI</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>ATM Both Active/Decay?</label>
+          <select id="atmBothFlag">
+            <option value="no">No</option>
+            <option value="yes">Yes (Avoid)</option>
+          </select>
+        </div>
+      </section>
+
+      <!-- Step 4 -->
+      <section class="card">
+        <div class="card-top">
+          <h3>4. ATM Premium Expansion</h3>
+          <span class="badge" id="b4">—</span>
+        </div>
+        <div class="field">
+          <label>Option Chain Zero-Line Chart</label>
+          <select id="atmChart">
+            <option value="">—</option>
+            <option value="bull">Call Expanding (&gt; 0)</option>
+            <option value="bear">Put Expanding (&gt; 0)</option>
+            <option value="avoid">Both Below Zero (Avoid)</option>
+          </select>
+        </div>
+        <div class="stat">Tip: Verify ATM strike chart on NSE Option Chain.</div>
+      </section>
+
+      <!-- Step 5 -->
+      <section class="card">
+        <div class="card-top">
+          <h3>5. Intraday Mid-Level</h3>
+          <span class="badge" id="b5">—</span>
+        </div>
+        <div class="row">
+          <div class="field"><label>High</label><input type="number" step="0.05" id="nHigh" /></div>
+          <div class="field"><label>Low</label><input type="number" step="0.05" id="nLow" /></div>
+          <div class="field"><label>LTP</label><input type="number" step="0.05" id="nLtp" /></div>
+        </div>
+        <div class="stat">Center: <strong id="midVal">—</strong> | Entry/SL: <strong id="planVal">—</strong></div>
+      </section>
+    </div>
+
+    <div class="summary">
+      <div>
+        <div class="stat">Final Checklist Verdict</div>
+        <div class="verdict" id="finalVerdict">WAITING FOR DATA</div>
+      </div>
+      <div class="stat" id="tallyText">Bullish: 0 | Bearish: 0 | Avoid: 0</div>
+    </div>
+  </div>
+
+  <script>
+    let autoSyncEnabled = true;
+
+    setInterval(() => {
+      document.getElementById("istClock").textContent =
+        new Intl.DateTimeFormat("en-GB", {
+          timeZone: "Asia/Kolkata",
+          hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+        }).format(new Date()) + " IST";
+    }, 1000);
+
+    function setBadge(id, sig) {
+      const el = document.getElementById(id);
+      el.className = "badge";
+      if (!sig) { el.textContent = "—"; return; }
+      el.classList.add(sig);
+      el.textContent = sig === "bull" ? "BULLISH" : sig === "bear" ? "BEARISH" : "AVOID";
+    }
+
+    function ratioSig(adv, dec, outId) {
+      if (!adv || !dec || dec <= 0) {
+        document.getElementById(outId).textContent = "—";
+        return null;
+      }
+      const r = adv / dec;
+      document.getElementById(outId).textContent = r.toFixed(2);
+      if (r > 1.15) return "bull";
+      if (r < 0.87) return "bear";
+      return "avoid";
+    }
+
+    function evaluate() {
+      // Step 1
+      const r1 = ratioSig(parseFloat(nseAdv.value), parseFloat(nseDec.value), "nseRatio");
+      const r2 = ratioSig(parseFloat(nifAdv.value), parseFloat(nifDec.value), "nifRatio");
+      const s1 = (r1 === "avoid" || r2 === "avoid") ? "avoid" : (r1 && r2 ? (r1 === r2 ? r1 : "avoid") : (r1 || r2));
+      setBadge("b1", s1);
+
+      // Step 2
+      const map = [[secBank, 37], [secOil, 10], [secIt, 9]];
+      let bw = 0, dw = 0, anySec = false;
+      map.forEach(([el, w]) => {
+        if (el.value) anySec = true;
+        if (el.value === "bull") bw += w;
+        if (el.value === "bear") dw += w;
+      });
+      wBull.textContent = bw + "%";
+      wBear.textContent = dw + "%";
+      const s2 = anySec ? ((bw >= 37 && bw > dw) ? "bull" : (dw >= 37 && dw > bw) ? "bear" : "avoid") : null;
+      setBadge("b2", s2);
+
+      // Step 3
+      let s3 = null;
+      if (atmBothFlag.value === "yes") s3 = "avoid";
+      else if (optVol.value && optOi.value) s3 = optVol.value === optOi.value ? optVol.value : "avoid";
+      else s3 = optVol.value || optOi.value || null;
+      setBadge("b3", s3);
+
+      // Step 4
+      const s4 = atmChart.value || null;
+      setBadge("b4", s4);
+
+      // Step 5
+      const h = parseFloat(nHigh.value), l = parseFloat(nLow.value), p = parseFloat(nLtp.value);
+      let s5 = null;
+      if (!isNaN(h) && !isNaN(l) && h > l) {
+        const mid = (h + l) / 2;
+        midVal.textContent = mid.toFixed(1);
+        if (!isNaN(p)) {
+          s5 = p > mid ? "bull" : p < mid ? "bear" : "avoid";
+          planVal.textContent = p >= mid ? `Entry ~${mid.toFixed(1)} | SL ${l.toFixed(1)}` : `Entry ~${mid.toFixed(1)} | SL ${h.toFixed(1)}`;
+        } else {
+          planVal.textContent = "Enter LTP";
+        }
+      } else {
+        midVal.textContent = "—";
+        planVal.textContent = "—";
+      }
+      setBadge("b5", s5);
+
+      // Summary
+      const all = [s1, s2, s3, s4, s5];
+      const bulls = all.filter(x => x === "bull").length;
+      const bears = all.filter(x => x === "bear").length;
+      const avoids = all.filter(x => x === "avoid").length;
+      tallyText.textContent = `Bullish: ${bulls} | Bearish: ${bears} | Avoid: ${avoids}`;
+
+      finalVerdict.className = "verdict";
+      if (avoids > 0) {
+        finalVerdict.classList.add("avoid");
+        finalVerdict.textContent = "NO-TRADE / AVOID";
+      } else if (bulls >= 3 && bears === 0) {
+        finalVerdict.classList.add("bull");
+        finalVerdict.textContent = "READY: FOCUS ON CALLS";
+      } else if (bears >= 3 && bulls === 0) {
+        finalVerdict.classList.add("bear");
+        finalVerdict.textContent = "READY: FOCUS ON PUTS";
+      } else if (bulls > 0 && bears > 0) {
+        finalVerdict.classList.add("avoid");
+        finalVerdict.textContent = "CONFLICTING SIGNALS";
+      } else {
+        finalVerdict.textContent = "WAITING FOR DATA";
+      }
+    }
+
+    async function loadNseData() {
+      try {
+        const res = await fetch(`./nse_data.json?t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error("JSON not found");
+        const d = await res.json();
+
+        if (d.nse_adv != null) nseAdv.value = d.nse_adv;
+        if (d.nse_dec != null) nseDec.value = d.nse_dec;
+        if (d.nifty_adv != null) nifAdv.value = d.nifty_adv;
+        if (d.nifty_dec != null) nifDec.value = d.nifty_dec;
+        if (d.sec_bank) secBank.value = d.sec_bank;
+        if (d.sec_oil) secOil.value = d.sec_oil;
+        if (d.sec_it) secIt.value = d.sec_it;
+        if (d.opt_vol) optVol.value = d.opt_vol;
+        if (d.opt_oi) optOi.value = d.opt_oi;
+        if (d.atm_both_flag) atmBothFlag.value = d.atm_both_flag;
+        if (d.atm_chart) atmChart.value = d.atm_chart;
+        if (d.high != null) nHigh.value = d.high;
+        if (d.low != null) nLow.value = d.low;
+        if (d.ltp != null) nLtp.value = d.ltp;
+
+        syncMeta.textContent = `Auto-synced from nse_data.json • Updated: ${d.updated_at || "Just now"}`;
+        evaluate();
+      } catch (err) {
+        syncMeta.textContent = "Manual mode active (Place nse_data.json beside index.html for auto-update)";
+        evaluate();
+      }
+    }
+
+    document.querySelectorAll("input, select").forEach(el => {
+      el.addEventListener("input", evaluate);
+      el.addEventListener("change", evaluate);
+    });
+
+    syncNowBtn.addEventListener("click", loadNseData);
+    autoSyncBtn.addEventListener("click", () => {
+      autoSyncEnabled = !autoSyncEnabled;
+      autoSyncBtn.classList.toggle("active", autoSyncEnabled);
+      autoSyncBtn.textContent = `Auto-Sync (60s): ${autoSyncEnabled ? "ON" : "OFF"}`;
+    });
+
+    setInterval(() => {
+      if (autoSyncEnabled) loadNseData();
+    }, 60000);
+
+    loadNseData();
+  </script>
+</body>
+</html>
