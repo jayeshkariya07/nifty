@@ -24,37 +24,79 @@ def pct_to_sig(pct_val):
     return "flat"
 
 
-def analyze_option_chain(oc_json, spot_price):
-    records = oc_json.get("records", {})
-    data_rows = records.get("data", [])
-    underlying = spot_price or records.get("underlyingValue") or 0
+def parse_nse_expiry(exp_str):
+    for fmt in ("%d-%b-%Y", "%d-%B-%Y"):
+        try:
+            return datetime.strptime(exp_str, fmt).date()
+        except ValueError:
+            continue
+    return None
 
-    if not data_rows or not underlying:
+
+def resolve_expiries(records, today_ist):
+    raw_expiries = records.get("expiryDates") or []
+    parsed = []
+    for s in raw_expiries:
+        dt = parse_nse_expiry(s)
+        if dt and dt >= today_ist:
+            parsed.append((dt, s))
+
+    # Fallback: collect unique expiry strings from records.data if expiryDates is empty
+    if not parsed:
+        seen = set()
+        for r in records.get("data", []):
+            s = r.get("expiryDate")
+            if s and s not in seen:
+                seen.add(s)
+                dt = parse_nse_expiry(s)
+                if dt and dt >= today_ist:
+                    parsed.append((dt, s))
+
+    parsed.sort(key=lambda x: x[0])
+    if not parsed:
+        return None, None
+
+    nearest_weekly_dt, nearest_weekly_str = parsed[0]
+
+    # Monthly expiry is typically the final expiry of the month
+    same_month = [item for item in parsed if item[0].year == nearest_weekly_dt.year and item[0].month == nearest_weekly_dt.month]
+    if same_month:
+        monthly_dt, monthly_str = same_month[-1]
+    else:
+        next_month_dt = parsed[-1][0]
+        next_month_items = [item for item in parsed if item[0].year == next_month_dt.year and item[0].month == next_month_dt.month]
+        monthly_dt, monthly_str = next_month_items[-1]
+
+    return nearest_weekly_str, monthly_str
+
+
+def compute_expiry_metrics(rows_for_expiry, underlying):
+    if not rows_for_expiry or not underlying:
         return {
             "opt_vol": "",
             "opt_oi": "",
             "atm_both_flag": "no",
             "atm_strike": None,
+            "avg_call_pct": 0.0,
+            "avg_put_pct": 0.0,
+            "call_oi_chg": 0.0,
+            "put_oi_chg": 0.0,
         }
 
-    # Find nearest ATM strike
-    strikes = sorted({row.get("strikePrice") for row in data_rows if row.get("strikePrice") is not None})
+    strikes = sorted({r.get("strikePrice") for r in rows_for_expiry if r.get("strikePrice") is not None})
     atm_strike = min(strikes, key=lambda s: abs(s - underlying)) if strikes else None
 
-    # Focus on strikes within +/- 500 points of ATM (or all available if fewer)
     near_rows = [
-        r for r in data_rows
+        r for r in rows_for_expiry
         if r.get("strikePrice") is not None and abs(r.get("strikePrice") - atm_strike) <= 500
-    ] or data_rows
+    ] or rows_for_expiry
 
     call_pct_changes = []
     put_pct_changes = []
-
     call_oi_chg_sum = 0.0
     put_oi_chg_sum = 0.0
     call_oi_tot_sum = 0.0
     put_oi_tot_sum = 0.0
-
     oi_contracts = []
 
     for r in near_rows:
@@ -84,7 +126,6 @@ def analyze_option_chain(oc_json, spot_price):
             put_oi_tot_sum += oi_tot
             oi_contracts.append(("PE", strike, oi_tot))
 
-    # 1. Volume / Price Appreciation comparison (Calls vs Puts)
     avg_call_pct = sum(call_pct_changes) / len(call_pct_changes) if call_pct_changes else 0.0
     avg_put_pct = sum(put_pct_changes) / len(put_pct_changes) if put_pct_changes else 0.0
 
@@ -95,7 +136,6 @@ def analyze_option_chain(oc_json, spot_price):
     else:
         opt_vol = ""
 
-    # 2. Contra-OI signal (more Put OI buildup -> bullish contra; more Call OI buildup -> bearish contra)
     put_oi_score = put_oi_chg_sum if (put_oi_chg_sum != 0 or call_oi_chg_sum != 0) else put_oi_tot_sum
     call_oi_score = call_oi_chg_sum if (put_oi_chg_sum != 0 or call_oi_chg_sum != 0) else call_oi_tot_sum
 
@@ -106,7 +146,6 @@ def analyze_option_chain(oc_json, spot_price):
     else:
         opt_oi = ""
 
-    # 3. Check if both ATM CE and ATM PE rank among top active OI contracts
     top_oi = sorted(oi_contracts, key=lambda x: x[2], reverse=True)[:6]
     top_set = {(opt_type, strike) for opt_type, strike, _ in top_oi}
     atm_both_active = ("CE", atm_strike) in top_set and ("PE", atm_strike) in top_set
@@ -123,11 +162,32 @@ def analyze_option_chain(oc_json, spot_price):
     }
 
 
-def fetch_nse_snapshot():
+def analyze_option_chain(oc_json, spot_price, today_ist, primary_expiry="weekly"):
+    records = oc_json.get("records", {})
+    data_rows = records.get("data", [])
+    underlying = spot_price or records.get("underlyingValue") or 0
+
+    weekly_exp, monthly_exp = resolve_expiries(records, today_ist)
+
+    weekly_rows = [r for r in data_rows if r.get("expiryDate") == weekly_exp] if weekly_exp else []
+    monthly_rows = [r for r in data_rows if r.get("expiryDate") == monthly_exp] if monthly_exp else []
+
+    weekly_metrics = compute_expiry_metrics(weekly_rows, underlying)
+    monthly_metrics = compute_expiry_metrics(monthly_rows, underlying)
+
+    chosen = monthly_metrics if primary_expiry == "monthly" else weekly_metrics
+
+    return {
+        "primary": chosen,
+        "weekly": {"expiry": weekly_exp, **weekly_metrics},
+        "monthly": {"expiry": monthly_exp, **monthly_metrics},
+    }
+
+
+def fetch_nse_snapshot(primary_expiry="weekly"):
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # Warm up session cookies on NSE option-chain page
     session.get("https://www.nseindia.com/option-chain", timeout=12)
 
     all_ind = session.get("https://www.nseindia.com/api/allIndices", timeout=12).json()
@@ -151,11 +211,15 @@ def fetch_nse_snapshot():
     low_val = nifty_50_item.get("low") or nifty_meta.get("low")
     ltp_val = nifty_50_item.get("last") or nifty_meta.get("lastPrice")
 
-    oc_summary = analyze_option_chain(oc_data, ltp_val)
-    ist_now = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S IST")
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    oc_analysis = analyze_option_chain(oc_data, ltp_val, now_ist.date(), primary_expiry=primary_expiry)
+    primary = oc_analysis["primary"]
 
     payload = {
-        "updated_at": ist_now,
+        "updated_at": now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "expiry_scope": primary_expiry,
+        "weekly_expiry": oc_analysis["weekly"]["expiry"],
+        "monthly_expiry": oc_analysis["monthly"]["expiry"],
         "nse_adv": None,
         "nse_dec": None,
         "nifty_adv": int(adv_dec.get("advances", 0)),
@@ -163,28 +227,26 @@ def fetch_nse_snapshot():
         "sec_bank": pct_to_sig(bank_item.get("percentChange")),
         "sec_oil": pct_to_sig(oil_item.get("percentChange")),
         "sec_it": pct_to_sig(it_item.get("percentChange")),
-        "opt_vol": oc_summary["opt_vol"],
-        "opt_oi": oc_summary["opt_oi"],
-        "atm_both_flag": oc_summary["atm_both_flag"],
+        "opt_vol": primary["opt_vol"],
+        "opt_oi": primary["opt_oi"],
+        "atm_both_flag": primary["atm_both_flag"],
         "atm_chart": "",
         "high": high_val,
         "low": low_val,
         "ltp": ltp_val,
         "oc_diagnostics": {
-            "atm_strike": oc_summary.get("atm_strike"),
-            "avg_call_pct": oc_summary.get("avg_call_pct"),
-            "avg_put_pct": oc_summary.get("avg_put_pct"),
-            "call_oi_chg": oc_summary.get("call_oi_chg"),
-            "put_oi_chg": oc_summary.get("put_oi_chg"),
+            "weekly": oc_analysis["weekly"],
+            "monthly": oc_analysis["monthly"],
         },
     }
 
     with open("nse_data.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
-    print("Updated nse_data.json at", ist_now)
-    print("Option Chain Step 3:", payload["opt_vol"], payload["opt_oi"], "ATM Both:", payload["atm_both_flag"])
+    print(
+        f"Updated nse_data.json ({primary_expiry} -> W:{payload['weekly_expiry']} | M:{payload['monthly_expiry']}) at {payload['updated_at']}"
+    )
 
 
 if __name__ == "__main__":
-    fetch_nse_snapshot()
+    fetch_nse_snapshot(primary_expiry="weekly")
