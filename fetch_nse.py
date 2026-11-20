@@ -13,9 +13,12 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/option-chain",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
 }
 
-RETRYABLE_STATUS_CODES = {401, 403, 408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {401, 403, 404, 408, 425, 429, 500, 502, 503, 504}
 
 
 def pct_to_sig(pct_val):
@@ -38,8 +41,8 @@ def to_int_or_none(val):
 
 
 def warm_up_session(session):
-    """Refresh NSE session cookies by visiting the option-chain page."""
-    resp = session.get("https://www.nseindia.com/option-chain", timeout=15)
+    """Refresh NSE session cookies on nseindia.com."""
+    resp = session.get("https://www.nseindia.com/option-chain", timeout=15, allow_redirects=True)
     resp.raise_for_status()
     time.sleep(random.uniform(0.8, 1.5))
 
@@ -55,13 +58,21 @@ def request_with_retry(
 ):
     """
     Perform an HTTP GET with exponential backoff + jitter.
-    Re-warms NSE cookies on auth/rate-limit responses (401/403/429).
+    Re-warms NSE cookies on auth/rate-limit/redirect responses.
     """
     last_err = None
 
     for attempt in range(max_retries + 1):
         try:
-            resp = session.get(url, timeout=timeout)
+            resp = session.get(url, timeout=timeout, allow_redirects=False)
+
+            # Guard against redirects to nseindia.in or login pages
+            if resp.is_redirect or resp.is_permanent_redirect:
+                loc = resp.headers.get("Location", "")
+                raise requests.HTTPError(
+                    f"Unexpected redirect ({resp.status_code} -> {loc}) for {url}",
+                    response=resp,
+                )
 
             if resp.status_code in RETRYABLE_STATUS_CODES:
                 raise requests.HTTPError(
@@ -79,12 +90,10 @@ def request_with_retry(
             if attempt >= max_retries:
                 break
 
-            status = getattr(getattr(err, "response", None), "status_code", None)
-            if status in (401, 403, 429):
-                try:
-                    warm_up_session(session)
-                except requests.RequestException:
-                    pass
+            try:
+                warm_up_session(session)
+            except requests.RequestException:
+                pass
 
             exp_wait = min(max_delay, base_delay * (2 ** attempt))
             jitter = random.uniform(0.25, 0.85)
@@ -99,10 +108,6 @@ def request_with_retry(
 
 
 def extract_overall_nse_breadth(session, all_ind_json):
-    """
-    Attempt to retrieve overall NSE market advancing and declining counts.
-    Tries broad market indices/endpoints first and falls back gracefully.
-    """
     for item in all_ind_json.get("data", []):
         idx_name = (item.get("index") or "").upper()
         if idx_name in ("NIFTY TOTAL MARKET", "ALL", "NIFTY 500"):
@@ -300,15 +305,7 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    request_with_retry(
-        session,
-        "https://www.nseindia.com/option-chain",
-        max_retries=3,
-        base_delay=1.5,
-        timeout=15,
-        expect_json=False,
-    )
-    time.sleep(random.uniform(0.8, 1.5))
+    warm_up_session(session)
 
     all_ind = request_with_retry(
         session, "https://www.nseindia.com/api/allIndices", timeout=15
