@@ -48,4 +48,4 @@ jobs:
       - name: Install Python dependencies and Playwright Chromium
         run: |
           pip install playwright
-          playwright install chromium
+          playwright install --with-deps chromium
