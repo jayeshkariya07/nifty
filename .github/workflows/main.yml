@@ -41,5 +41,6 @@ jobs:
             echo "No changes to nse_data.json."
           else
             git commit -m "chore: update nse_data.json"
+            git pull --rebase --autostash origin HEAD
             git push
           fi
