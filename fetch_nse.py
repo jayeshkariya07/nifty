@@ -1,196 +1,64 @@
+import csv
+import io
 import json
 import os
-import random
-import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import requests
+from playwright.sync_api import sync_playwright
 
-BASE_URL = "https://www.nseindia.in"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": f"{BASE_URL}/option-chain",
-    "Origin": BASE_URL,
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Dest": "empty",
-}
-
-RETRYABLE_STATUS_CODES = {401, 403, 404, 408, 425, 429, 500, 502, 503, 504}
+PAGE_URL = "https://www.nseindia.in/option-chain"
 
 
-def pct_to_sig(pct_val):
-    if pct_val is None:
-        return ""
-    if pct_val > 0.15:
-        return "bull"
-    if pct_val < -0.15:
-        return "bear"
-    return "flat"
-
-
-def to_int_or_none(val):
-    if val is None or val == "":
+def to_float_or_none(val):
+    if val is None:
+        return None
+    s = str(val).strip().replace(",", "").replace("%", "")
+    if s in ("", "-", "NA", "N/A", "null", "None"):
         return None
     try:
-        return int(float(val))
+        return float(s)
     except (ValueError, TypeError):
         return None
 
 
-def warm_up_session(session):
-    """Refresh NSE session cookies on nseindia.in."""
-    resp = session.get(f"{BASE_URL}/option-chain", timeout=15, allow_redirects=True)
-    resp.raise_for_status()
-    time.sleep(random.uniform(0.8, 1.5))
-
-
-def request_with_retry(
-    session,
-    url,
-    max_retries=4,
-    base_delay=1.5,
-    max_delay=20.0,
-    timeout=15,
-    expect_json=True,
-    allow_404=False,
-):
-    """
-    Perform an HTTP GET with exponential backoff + jitter.
-    Re-warms NSE cookies on auth/rate-limit responses.
-    """
-    last_err = None
-
-    for attempt in range(max_retries + 1):
-        try:
-            resp = session.get(url, timeout=timeout, allow_redirects=True)
-
-            if allow_404 and resp.status_code == 404:
-                print(f"[Info] {url} returned 404; using fallback data.")
-                return None
-
-            if resp.status_code in RETRYABLE_STATUS_CODES:
-                raise requests.HTTPError(
-                    f"Retryable HTTP {resp.status_code} for {resp.url}", response=resp
-                )
-
-            resp.raise_for_status()
-
-            if expect_json:
-                return resp.json()
-            return resp.text
-
-        except (requests.RequestException, ValueError) as err:
-            last_err = err
-            if attempt >= max_retries:
-                break
-
-            status = getattr(getattr(err, "response", None), "status_code", None)
-            if status in (401, 403, 429):
-                try:
-                    warm_up_session(session)
-                except requests.RequestException:
-                    pass
-
-            exp_wait = min(max_delay, base_delay * (2 ** attempt))
-            jitter = random.uniform(0.25, 0.85)
-            sleep_for = exp_wait + jitter
-            print(
-                f"[Retry {attempt + 1}/{max_retries}] {url} failed ({err}). "
-                f"Backing off {sleep_for:.2f}s..."
-            )
-            time.sleep(sleep_for)
-
-    raise RuntimeError(f"Failed to fetch {url} after {max_retries + 1} attempts") from last_err
-
-
-def extract_overall_nse_breadth(session, all_ind_json):
-    for item in all_ind_json.get("data", []):
-        idx_name = (item.get("index") or "").upper()
-        if idx_name in ("NIFTY TOTAL MARKET", "ALL", "NIFTY 500"):
-            adv = to_int_or_none(item.get("advances"))
-            dec = to_int_or_none(item.get("declines"))
-            if adv is not None and dec is not None:
-                return adv, dec
-
-    for idx_query in ("NIFTY%20500", "SECURITIES%20IN%20F%26O"):
-        try:
-            time.sleep(random.uniform(0.6, 1.2))
-            payload = request_with_retry(
-                session,
-                f"{BASE_URL}/api/equity-stockIndices?index={idx_query}",
-                max_retries=2,
-                base_delay=1.0,
-                timeout=12,
-                allow_404=True,
-            )
-            if not isinstance(payload, dict):
-                continue
-            adv_obj = payload.get("advance") or {}
-            adv = to_int_or_none(adv_obj.get("advances"))
-            dec = to_int_or_none(adv_obj.get("declines"))
-            if adv is not None and dec is not None:
-                return adv, dec
-        except Exception:
-            continue
-
-    return None, None
-
-
 def parse_nse_expiry(exp_str):
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y"):
+    if not exp_str:
+        return None
+    s = str(exp_str).strip()
+    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%d-%b-%y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
-            return datetime.strptime(exp_str, fmt).date()
+            return datetime.strptime(s, fmt).date()
         except ValueError:
             continue
     return None
 
 
-def resolve_expiries(records, today_ist):
-    raw_expiries = records.get("expiryDates") or []
+def resolve_expiries(expiry_strings, today_ist):
     parsed = []
-    for s in raw_expiries:
+    for s in expiry_strings:
         dt = parse_nse_expiry(s)
         if dt and dt >= today_ist:
             parsed.append((dt, s))
-
     if not parsed:
-        seen = set()
-        for r in records.get("data", []):
-            s = r.get("expiryDate")
-            if s and s not in seen:
-                seen.add(s)
-                dt = parse_nse_expiry(s)
-                if dt and dt >= today_ist:
-                    parsed.append((dt, s))
+        for s in expiry_strings:
+            dt = parse_nse_expiry(s)
+            if dt:
+                parsed.append((dt, s))
 
     parsed.sort(key=lambda x: x[0])
     if not parsed:
         return None, None
 
-    nearest_weekly_dt, nearest_weekly_str = parsed[0]
-
-    same_month = [
-        item for item in parsed
-        if item[0].year == nearest_weekly_dt.year and item[0].month == nearest_weekly_dt.month
-    ]
+    wk_dt, wk_str = parsed[0]
+    same_month = [item for item in parsed if item[0].year == wk_dt.year and item[0].month == wk_dt.month]
     if same_month:
-        _, monthly_str = same_month[-1]
+        _, mo_str = same_month[-1]
     else:
-        next_month_dt = parsed[-1][0]
-        next_month_items = [
-            item for item in parsed
-            if item[0].year == next_month_dt.year and item[0].month == next_month_dt.month
-        ]
-        _, monthly_str = next_month_items[-1]
+        last_dt = parsed[-1][0]
+        last_month_items = [item for item in parsed if item[0].year == last_dt.year and item[0].month == last_dt.month]
+        _, mo_str = last_month_items[-1]
 
-    return nearest_weekly_str, monthly_str
+    return wk_str, mo_str
 
 
 def compute_expiry_metrics(rows_for_expiry, underlying):
@@ -206,16 +74,27 @@ def compute_expiry_metrics(rows_for_expiry, underlying):
             "put_oi_chg": 0.0,
         }
 
-    strikes = sorted({r.get("strikePrice") for r in rows_for_expiry if r.get("strikePrice") is not None})
-    atm_strike = min(strikes, key=lambda s: abs(s - underlying)) if strikes else None
+    strikes = sorted({r["strike"] for r in rows_for_expiry if r.get("strike") is not None})
+    if not strikes:
+        return {
+            "opt_vol": "",
+            "opt_oi": "",
+            "atm_both_flag": "no",
+            "atm_strike": None,
+            "avg_call_pct": 0.0,
+            "avg_put_pct": 0.0,
+            "call_oi_chg": 0.0,
+            "put_oi_chg": 0.0,
+        }
 
+    atm_strike = min(strikes, key=lambda s: abs(s - underlying))
     near_rows = [
         r for r in rows_for_expiry
-        if r.get("strikePrice") is not None and abs(r.get("strikePrice") - atm_strike) <= 500
+        if r.get("strike") is not None and abs(r["strike"] - atm_strike) <= 500
     ] or rows_for_expiry
 
-    call_pct_changes = []
-    put_pct_changes = []
+    call_pcts = []
+    put_pcts = []
     call_oi_chg_sum = 0.0
     put_oi_chg_sum = 0.0
     call_oi_tot_sum = 0.0
@@ -223,34 +102,34 @@ def compute_expiry_metrics(rows_for_expiry, underlying):
     oi_contracts = []
 
     for r in near_rows:
-        strike = r.get("strikePrice")
-        ce = r.get("CE")
-        pe = r.get("PE")
+        strike = r["strike"]
+        ce = r.get("CE") or {}
+        pe = r.get("PE") or {}
 
-        if isinstance(ce, dict):
-            last = ce.get("lastPrice")
-            prev = ce.get("previousClose")
-            if isinstance(last, (int, float)) and isinstance(prev, (int, float)) and prev > 0:
-                call_pct_changes.append(((last - prev) / prev) * 100.0)
-            oi_chg = ce.get("changeinOpenInterest") or 0.0
-            oi_tot = ce.get("openInterest") or 0.0
-            call_oi_chg_sum += oi_chg
-            call_oi_tot_sum += oi_tot
-            oi_contracts.append(("CE", strike, oi_tot))
+        ce_pct = ce.get("pct_chg")
+        if ce_pct is None and ce.get("ltp") is not None and ce.get("prev_close") not in (None, 0):
+            ce_pct = ((ce["ltp"] - ce["prev_close"]) / ce["prev_close"]) * 100.0
+        if ce_pct is not None:
+            call_pcts.append(ce_pct)
+        ce_oi_chg = ce.get("oi_chg") or 0.0
+        ce_oi = ce.get("oi") or 0.0
+        call_oi_chg_sum += ce_oi_chg
+        call_oi_tot_sum += ce_oi
+        oi_contracts.append(("CE", strike, ce_oi))
 
-        if isinstance(pe, dict):
-            last = pe.get("lastPrice")
-            prev = pe.get("previousClose")
-            if isinstance(last, (int, float)) and isinstance(prev, (int, float)) and prev > 0:
-                put_pct_changes.append(((last - prev) / prev) * 100.0)
-            oi_chg = pe.get("changeinOpenInterest") or 0.0
-            oi_tot = pe.get("openInterest") or 0.0
-            put_oi_chg_sum += oi_chg
-            put_oi_tot_sum += oi_tot
-            oi_contracts.append(("PE", strike, oi_tot))
+        pe_pct = pe.get("pct_chg")
+        if pe_pct is None and pe.get("ltp") is not None and pe.get("prev_close") not in (None, 0):
+            pe_pct = ((pe["ltp"] - pe["prev_close"]) / pe["prev_close"]) * 100.0
+        if pe_pct is not None:
+            put_pcts.append(pe_pct)
+        pe_oi_chg = pe.get("oi_chg") or 0.0
+        pe_oi = pe.get("oi") or 0.0
+        put_oi_chg_sum += pe_oi_chg
+        put_oi_tot_sum += pe_oi
+        oi_contracts.append(("PE", strike, pe_oi))
 
-    avg_call_pct = sum(call_pct_changes) / len(call_pct_changes) if call_pct_changes else 0.0
-    avg_put_pct = sum(put_pct_changes) / len(put_pct_changes) if put_pct_changes else 0.0
+    avg_call_pct = sum(call_pcts) / len(call_pcts) if call_pcts else 0.0
+    avg_put_pct = sum(put_pcts) / len(put_pcts) if put_pcts else 0.0
 
     if avg_call_pct > avg_put_pct + 2.0:
         opt_vol = "bull"
@@ -270,7 +149,7 @@ def compute_expiry_metrics(rows_for_expiry, underlying):
         opt_oi = ""
 
     top_oi = sorted(oi_contracts, key=lambda x: x[2], reverse=True)[:6]
-    top_set = {(opt_type, strike) for opt_type, strike, _ in top_oi}
+    top_set = {(opt_t, st) for opt_t, st, _ in top_oi}
     atm_both_active = ("CE", atm_strike) in top_set and ("PE", atm_strike) in top_set
 
     return {
@@ -285,26 +164,196 @@ def compute_expiry_metrics(rows_for_expiry, underlying):
     }
 
 
-def analyze_option_chain(oc_json, spot_price, today_ist, primary_expiry="weekly"):
-    records = (oc_json or {}).get("records", {})
-    data_rows = records.get("data", [])
-    underlying = spot_price or records.get("underlyingValue") or 0
+def normalize_from_oc_json(oc_json):
+    records = oc_json.get("records") or {}
+    underlying = to_float_or_none(records.get("underlyingValue"))
+    expiries = records.get("expiryDates") or []
+    rows = []
 
-    weekly_exp, monthly_exp = resolve_expiries(records, today_ist)
+    for item in records.get("data") or []:
+        strike = to_float_or_none(item.get("strikePrice"))
+        exp = item.get("expiryDate")
+        if strike is None:
+            continue
+        ce_raw = item.get("CE") if isinstance(item.get("CE"), dict) else {}
+        pe_raw = item.get("PE") if isinstance(item.get("PE"), dict) else {}
+        rows.append({
+            "expiry": exp,
+            "strike": strike,
+            "CE": {
+                "ltp": to_float_or_none(ce_raw.get("lastPrice")),
+                "prev_close": to_float_or_none(ce_raw.get("previousClose")),
+                "pct_chg": to_float_or_none(ce_raw.get("pchangeinOpenInterest")),
+                "oi_chg": to_float_or_none(ce_raw.get("changeinOpenInterest")),
+                "oi": to_float_or_none(ce_raw.get("openInterest")),
+            },
+            "PE": {
+                "ltp": to_float_or_none(pe_raw.get("lastPrice")),
+                "prev_close": to_float_or_none(pe_raw.get("previousClose")),
+                "pct_chg": to_float_or_none(pe_raw.get("pchangeinOpenInterest")),
+                "oi_chg": to_float_or_none(pe_raw.get("changeinOpenInterest")),
+                "oi": to_float_or_none(pe_raw.get("openInterest")),
+            },
+        })
 
-    weekly_rows = [r for r in data_rows if r.get("expiryDate") == weekly_exp] if weekly_exp else []
-    monthly_rows = [r for r in data_rows if r.get("expiryDate") == monthly_exp] if monthly_exp else []
+    return underlying, expiries, rows
 
-    weekly_metrics = compute_expiry_metrics(weekly_rows, underlying)
-    monthly_metrics = compute_expiry_metrics(monthly_rows, underlying)
 
-    chosen = monthly_metrics if primary_expiry == "monthly" else weekly_metrics
+def normalize_from_csv_text(csv_text, selected_expiry=None):
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows = []
+    expiries = []
+    seen_exp = set()
 
-    return {
-        "primary": chosen,
-        "weekly": {"expiry": weekly_exp, **weekly_metrics},
-        "monthly": {"expiry": monthly_exp, **monthly_metrics},
-    }
+    for raw in reader:
+        if not raw:
+            continue
+        row = {(k or "").strip().lower(): (v.strip() if isinstance(v, str) else v) for k, v in raw.items()}
+        exp = row.get("expiry date") or row.get("expiry") or selected_expiry
+        if exp and exp not in seen_exp:
+            seen_exp.add(exp)
+            expiries.append(exp)
+
+        strike = to_float_or_none(row.get("strike price") or row.get("strike"))
+        if strike is None:
+            continue
+
+        rows.append({
+            "expiry": exp,
+            "strike": strike,
+            "CE": {
+                "ltp": to_float_or_none(row.get("ce ltp") or row.get("call ltp") or row.get("ltp")),
+                "prev_close": to_float_or_none(row.get("ce prev close") or row.get("prev close")),
+                "pct_chg": to_float_or_none(row.get("ce chng") or row.get("chng")),
+                "oi_chg": to_float_or_none(row.get("ce chng in oi") or row.get("chng in oi")),
+                "oi": to_float_or_none(row.get("ce oi") or row.get("oi")),
+            },
+            "PE": {
+                "ltp": to_float_or_none(row.get("pe ltp") or row.get("put ltp")),
+                "prev_close": to_float_or_none(row.get("pe prev close")),
+                "pct_chg": to_float_or_none(row.get("pe chng")),
+                "oi_chg": to_float_or_none(row.get("pe chng in oi")),
+                "oi": to_float_or_none(row.get("pe oi")),
+            },
+        })
+
+    return None, expiries, rows
+
+
+def scrape_option_chain_page():
+    captured_json = []
+    captured_csv = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1440, "height": 900},
+            accept_downloads=True,
+        )
+        page = context.new_page()
+
+        def handle_response(resp):
+            ctype = (resp.headers.get("content-type") or "").lower()
+            url = resp.url.lower()
+            try:
+                if "option-chain" in url and "json" in ctype:
+                    captured_json.append(resp.json())
+                elif "csv" in ctype or url.endswith(".csv"):
+                    captured_csv.append(resp.text())
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+
+        page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(5000)
+
+        # Extract visible Underlying Index and active expiry from page text/selects
+        body_text = page.inner_text("body")
+        underlying_dom = None
+        for line in body_text.splitlines():
+            if "Underlying Index" in line and "NIFTY" in line:
+                parts = line.split("NIFTY", 1)[-1].split()
+                for tok in parts:
+                    val = to_float_or_none(tok)
+                    if val is not None and val > 1000:
+                        underlying_dom = val
+                        break
+
+        selected_expiry = None
+        try:
+            sel = page.locator("select").nth(2)
+            if sel.count() > 0:
+                selected_expiry = sel.input_value().strip()
+        except Exception:
+            pass
+
+        # If no JSON/CSV response was intercepted yet, try clicking "Download (.csv)"
+        if not captured_json and not captured_csv:
+            try:
+                dl_btn = page.get_by_text("Download (.csv)", exact=False).first
+                if dl_btn.count() > 0:
+                    with page.expect_download(timeout=10000) as dl_info:
+                        dl_btn.click()
+                    dl_path = dl_info.value.path()
+                    with open(dl_path, "r", encoding="utf-8-sig", errors="replace") as f:
+                        captured_csv.append(f.read())
+            except Exception:
+                pass
+
+        # Fallback: parse visible HTML table rows (CALLS | STRIKE | PUTS)
+        dom_rows = []
+        if not captured_json and not captured_csv:
+            raw_table_rows = page.evaluate(
+                """() => Array.from(document.querySelectorAll('table tr')).map(tr =>
+                    Array.from(tr.querySelectorAll('th, td')).map(c => c.innerText.trim())
+                )"""
+            )
+            for cells in raw_table_rows:
+                # Standard NSE OC table has 21 columns: 10 CALLS + 1 STRIKE + 10 PUTS
+                if len(cells) >= 21:
+                    strike = to_float_or_none(cells[10])
+                    if strike is not None:
+                        dom_rows.append({
+                            "expiry": selected_expiry,
+                            "strike": strike,
+                            "CE": {
+                                "oi": to_float_or_none(cells[0]),
+                                "oi_chg": to_float_or_none(cells[1]),
+                                "pct_chg": to_float_or_none(cells[5]),
+                                "ltp": to_float_or_none(cells[4]),
+                                "prev_close": None,
+                            },
+                            "PE": {
+                                "ltp": to_float_or_none(cells[15]),
+                                "pct_chg": to_float_or_none(cells[14]),
+                                "oi_chg": to_float_or_none(cells[18]),
+                                "oi": to_float_or_none(cells[19]),
+                                "prev_close": None,
+                            },
+                        })
+
+        browser.close()
+
+    if captured_json:
+        underlying, expiries, rows = normalize_from_oc_json(captured_json[-1])
+        source_mode = "page_json"
+    elif captured_csv:
+        underlying, expiries, rows = normalize_from_csv_text(captured_csv[-1], selected_expiry)
+        source_mode = "page_csv"
+    else:
+        underlying, expiries, rows = None, [selected_expiry] if selected_expiry else [], dom_rows
+        source_mode = "page_dom"
+
+    final_underlying = underlying or underlying_dom
+    return source_mode, final_underlying, expiries, rows
 
 
 def load_existing_json(path="nse_data.json"):
@@ -316,103 +365,50 @@ def load_existing_json(path="nse_data.json"):
                     return data
         except Exception:
             pass
-    return None
+    return {}
 
 
 def fetch_nse_snapshot(primary_expiry="weekly"):
-    session = requests.Session()
-    session.headers.update(HEADERS)
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
     existing = load_existing_json("nse_data.json")
 
-    try:
-        warm_up_session(session)
+    source_mode, underlying, expiries, rows = scrape_option_chain_page()
+    wk_exp, mo_exp = resolve_expiries(expiries, now_ist.date())
 
-        all_ind = request_with_retry(
-            session, f"{BASE_URL}/api/allIndices", timeout=15
-        )
-        time.sleep(random.uniform(0.7, 1.3))
+    wk_rows = [r for r in rows if r.get("expiry") == wk_exp] if wk_exp else rows
+    mo_rows = [r for r in rows if r.get("expiry") == mo_exp] if mo_exp else rows
 
-        nifty_eq = None
-        try:
-            nifty_eq = request_with_retry(
-                session,
-                f"{BASE_URL}/api/equity-stockIndices?index=NIFTY%2050",
-                max_retries=2,
-                timeout=15,
-                allow_404=True,
-            )
-        except RuntimeError as err:
-            print(f"[Warn] equity-stockIndices failed ({err}); using fallback.")
+    wk_metrics = compute_expiry_metrics(wk_rows, underlying)
+    mo_metrics = compute_expiry_metrics(mo_rows, underlying)
 
-        time.sleep(random.uniform(0.7, 1.3))
-
-        oc_data = request_with_retry(
-            session,
-            f"{BASE_URL}/api/option-chain-indices?symbol=NIFTY",
-            timeout=15,
-        )
-    except Exception as exc:
-        print(f"[Error] NSE fetch failed: {exc}")
-        if existing is not None:
-            existing["fetch_status"] = f"fallback_cached ({exc})"
-            with open("nse_data.json", "w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=2)
-            print("[Info] Preserved existing nse_data.json without failing workflow.")
-            return
-        raise
-
-    nse_adv, nse_dec = extract_overall_nse_breadth(session, all_ind)
-
-    indices_by_name = {item.get("index"): item for item in all_ind.get("data", [])}
-    nifty_eq = nifty_eq if isinstance(nifty_eq, dict) else {}
-    nifty_meta = nifty_eq.get("metadata") or {}
-    adv_dec = nifty_eq.get("advance") or {}
-
-    nifty_50_item = indices_by_name.get("NIFTY 50") or {}
-    bank_item = indices_by_name.get("NIFTY BANK") or indices_by_name.get("NIFTY FIN SERVICE") or {}
-    oil_item = indices_by_name.get("NIFTY OIL & GAS") or {}
-    it_item = indices_by_name.get("NIFTY IT") or {}
-
-    oc_underlying = ((oc_data or {}).get("records") or {}).get("underlyingValue")
-
-    high_val = nifty_50_item.get("high") or nifty_meta.get("high")
-    low_val = nifty_50_item.get("low") or nifty_meta.get("low")
-    ltp_val = nifty_50_item.get("last") or nifty_meta.get("lastPrice") or oc_underlying
-
-    nifty_adv = to_int_or_none(adv_dec.get("advances"))
-    nifty_dec = to_int_or_none(adv_dec.get("declines"))
-    if nifty_adv is None:
-        nifty_adv = to_int_or_none(nifty_50_item.get("advances"))
-    if nifty_dec is None:
-        nifty_dec = to_int_or_none(nifty_50_item.get("declines"))
-
-    oc_analysis = analyze_option_chain(oc_data, ltp_val, now_ist.date(), primary_expiry=primary_expiry)
-    primary = oc_analysis["primary"]
+    wk_diag = {"expiry": wk_exp, **wk_metrics}
+    mo_diag = {"expiry": mo_exp, **mo_metrics}
+    primary = mo_diag if primary_expiry == "monthly" else wk_diag
 
     payload = {
         "updated_at": now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
-        "fetch_status": "ok",
+        "fetch_status": f"ok ({source_mode})",
+        "source_url": PAGE_URL,
         "expiry_scope": primary_expiry,
-        "weekly_expiry": oc_analysis["weekly"]["expiry"],
-        "monthly_expiry": oc_analysis["monthly"]["expiry"],
-        "nse_adv": nse_adv,
-        "nse_dec": nse_dec,
-        "nifty_adv": nifty_adv,
-        "nifty_dec": nifty_dec,
-        "sec_bank": pct_to_sig(bank_item.get("percentChange")),
-        "sec_oil": pct_to_sig(oil_item.get("percentChange")),
-        "sec_it": pct_to_sig(it_item.get("percentChange")),
-        "opt_vol": primary["opt_vol"],
-        "opt_oi": primary["opt_oi"],
-        "atm_both_flag": primary["atm_both_flag"],
-        "atm_chart": (existing or {}).get("atm_chart", ""),
-        "high": high_val,
-        "low": low_val,
-        "ltp": ltp_val,
+        "weekly_expiry": wk_exp,
+        "monthly_expiry": mo_exp,
+        "nse_adv": existing.get("nse_adv"),
+        "nse_dec": existing.get("nse_dec"),
+        "nifty_adv": existing.get("nifty_adv"),
+        "nifty_dec": existing.get("nifty_dec"),
+        "sec_bank": existing.get("sec_bank", ""),
+        "sec_oil": existing.get("sec_oil", ""),
+        "sec_it": existing.get("sec_it", ""),
+        "opt_vol": primary.get("opt_vol", ""),
+        "opt_oi": primary.get("opt_oi", ""),
+        "atm_both_flag": primary.get("atm_both_flag", "no"),
+        "atm_chart": existing.get("atm_chart", ""),
+        "high": existing.get("high"),
+        "low": existing.get("low"),
+        "ltp": underlying if underlying is not None else existing.get("ltp"),
         "oc_diagnostics": {
-            "weekly": oc_analysis["weekly"],
-            "monthly": oc_analysis["monthly"],
+            "weekly": wk_diag,
+            "monthly": mo_diag,
         },
     }
 
@@ -420,8 +416,8 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
         json.dump(payload, f, indent=2)
 
     print(
-        f"Updated nse_data.json | Overall A/D: {nse_adv}/{nse_dec} | "
-        f"NIFTY A/D: {nifty_adv}/{nifty_dec} at {payload['updated_at']}"
+        f"Updated nse_data.json ({source_mode}) | Underlying: {payload['ltp']} | "
+        f"Weekly: {wk_exp} | Monthly: {mo_exp} at {payload['updated_at']}"
     )
 
 
