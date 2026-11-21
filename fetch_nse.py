@@ -2,6 +2,8 @@ import csv
 import io
 import json
 import os
+import random
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
@@ -192,7 +194,7 @@ def normalize_from_oc_json(oc_json):
                 "prev_close": to_float_or_none(pe_raw.get("previousClose")),
                 "pct_chg": to_float_or_none(pe_raw.get("pchangeinOpenInterest")),
                 "oi_chg": to_float_or_none(pe_raw.get("changeinOpenInterest")),
-                "oi": to_float_or_none(pe_raw.get("openInterest")),
+                "oi": to_float_ornone(pe_raw.get("openInterest")),
             },
         })
 
@@ -240,6 +242,21 @@ def normalize_from_csv_text(csv_text, selected_expiry=None):
     return None, expiries, rows
 
 
+def goto_with_retry(page, url, attempts=3, timeout=45000):
+    last_err = None
+    for idx in range(attempts):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            return
+        except Exception as err:
+            last_err = err
+            if idx < attempts - 1:
+                wait_s = 2.0 * (idx + 1) + random.uniform(0.3, 0.9)
+                print(f"[Retry {idx + 1}/{attempts - 1}] page.goto failed ({err}). Retrying in {wait_s:.1f}s...")
+                time.sleep(wait_s)
+    raise last_err
+
+
 def scrape_option_chain_page():
     captured_json = []
     captured_csv = []
@@ -247,7 +264,12 @@ def scrape_option_chain_page():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-http2",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         )
         context = browser.new_context(
             user_agent=(
@@ -272,10 +294,9 @@ def scrape_option_chain_page():
 
         page.on("response", handle_response)
 
-        page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=45000)
+        goto_with_retry(page, PAGE_URL, attempts=3, timeout=45000)
         page.wait_for_timeout(5000)
 
-        # Extract visible Underlying Index and active expiry from page text/selects
         body_text = page.inner_text("body")
         underlying_dom = None
         for line in body_text.splitlines():
@@ -295,7 +316,6 @@ def scrape_option_chain_page():
         except Exception:
             pass
 
-        # If no JSON/CSV response was intercepted yet, try clicking "Download (.csv)"
         if not captured_json and not captured_csv:
             try:
                 dl_btn = page.get_by_text("Download (.csv)", exact=False).first
@@ -308,7 +328,6 @@ def scrape_option_chain_page():
             except Exception:
                 pass
 
-        # Fallback: parse visible HTML table rows (CALLS | STRIKE | PUTS)
         dom_rows = []
         if not captured_json and not captured_csv:
             raw_table_rows = page.evaluate(
@@ -317,7 +336,6 @@ def scrape_option_chain_page():
                 )"""
             )
             for cells in raw_table_rows:
-                # Standard NSE OC table has 21 columns: 10 CALLS + 1 STRIKE + 10 PUTS
                 if len(cells) >= 21:
                     strike = to_float_or_none(cells[10])
                     if strike is not None:
@@ -365,14 +383,26 @@ def load_existing_json(path="nse_data.json"):
                     return data
         except Exception:
             pass
-    return {}
+    return None
 
 
 def fetch_nse_snapshot(primary_expiry="weekly"):
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
     existing = load_existing_json("nse_data.json")
 
-    source_mode, underlying, expiries, rows = scrape_option_chain_page()
+    try:
+        source_mode, underlying, expiries, rows = scrape_option_chain_page()
+    except Exception as exc:
+        print(f"[Error] Playwright scrape failed: {exc}")
+        if existing is not None:
+            existing["fetch_status"] = f"fallback_cached ({exc})"
+            with open("nse_data.json", "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2)
+            print("[Info] Preserved existing nse_data.json without failing workflow.")
+            return
+        raise
+
+    existing_dict = existing or {}
     wk_exp, mo_exp = resolve_expiries(expiries, now_ist.date())
 
     wk_rows = [r for r in rows if r.get("expiry") == wk_exp] if wk_exp else rows
@@ -392,20 +422,20 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
         "expiry_scope": primary_expiry,
         "weekly_expiry": wk_exp,
         "monthly_expiry": mo_exp,
-        "nse_adv": existing.get("nse_adv"),
-        "nse_dec": existing.get("nse_dec"),
-        "nifty_adv": existing.get("nifty_adv"),
-        "nifty_dec": existing.get("nifty_dec"),
-        "sec_bank": existing.get("sec_bank", ""),
-        "sec_oil": existing.get("sec_oil", ""),
-        "sec_it": existing.get("sec_it", ""),
+        "nse_adv": existing_dict.get("nse_adv"),
+        "nse_dec": existing_dict.get("nse_dec"),
+        "nifty_adv": existing_dict.get("nifty_adv"),
+        "nifty_dec": existing_dict.get("nifty_dec"),
+        "sec_bank": existing_dict.get("sec_bank", ""),
+        "sec_oil": existing_dict.get("sec_oil", ""),
+        "sec_it": existing_dict.get("sec_it", ""),
         "opt_vol": primary.get("opt_vol", ""),
         "opt_oi": primary.get("opt_oi", ""),
         "atm_both_flag": primary.get("atm_both_flag", "no"),
-        "atm_chart": existing.get("atm_chart", ""),
-        "high": existing.get("high"),
-        "low": existing.get("low"),
-        "ltp": underlying if underlying is not None else existing.get("ltp"),
+        "atm_chart": existing_dict.get("atm_chart", ""),
+        "high": existing_dict.get("high"),
+        "low": existing_dict.get("low"),
+        "ltp": underlying if underlying is not None else existing_dict.get("ltp"),
         "oc_diagnostics": {
             "weekly": wk_diag,
             "monthly": mo_diag,
