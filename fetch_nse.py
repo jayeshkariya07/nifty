@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import time
 from datetime import datetime
@@ -21,7 +22,7 @@ HEADERS = {
     "Sec-Fetch-Dest": "empty",
 }
 
-RETRYABLE_STATUS_CODES = {401, 403, 408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {401, 403, 404, 408, 425, 429, 500, 502, 503, 504}
 
 
 def pct_to_sig(pct_val):
@@ -285,7 +286,7 @@ def compute_expiry_metrics(rows_for_expiry, underlying):
 
 
 def analyze_option_chain(oc_json, spot_price, today_ist, primary_expiry="weekly"):
-    records = oc_json.get("records", {})
+    records = (oc_json or {}).get("records", {})
     data_rows = records.get("data", [])
     underlying = spot_price or records.get("underlyingValue") or 0
 
@@ -306,36 +307,60 @@ def analyze_option_chain(oc_json, spot_price, today_ist, primary_expiry="weekly"
     }
 
 
+def load_existing_json(path="nse_data.json"):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return None
+
+
 def fetch_nse_snapshot(primary_expiry="weekly"):
     session = requests.Session()
     session.headers.update(HEADERS)
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    existing = load_existing_json("nse_data.json")
 
-    warm_up_session(session)
-
-    all_ind = request_with_retry(
-        session, f"{BASE_URL}/api/allIndices", timeout=15
-    )
-    time.sleep(random.uniform(0.7, 1.3))
-
-    nifty_eq = None
     try:
-        nifty_eq = request_with_retry(
-            session,
-            f"{BASE_URL}/api/equity-stockIndices?index=NIFTY%2050",
-            max_retries=2,
-            timeout=15,
-            allow_404=True,
+        warm_up_session(session)
+
+        all_ind = request_with_retry(
+            session, f"{BASE_URL}/api/allIndices", timeout=15
         )
-    except RuntimeError as err:
-        print(f"[Warn] equity-stockIndices failed ({err}); falling back to allIndices/option-chain.")
+        time.sleep(random.uniform(0.7, 1.3))
 
-    time.sleep(random.uniform(0.7, 1.3))
+        nifty_eq = None
+        try:
+            nifty_eq = request_with_retry(
+                session,
+                f"{BASE_URL}/api/equity-stockIndices?index=NIFTY%2050",
+                max_retries=2,
+                timeout=15,
+                allow_404=True,
+            )
+        except RuntimeError as err:
+            print(f"[Warn] equity-stockIndices failed ({err}); using fallback.")
 
-    oc_data = request_with_retry(
-        session,
-        f"{BASE_URL}/api/option-chain-indices?symbol=NIFTY",
-        timeout=15,
-    )
+        time.sleep(random.uniform(0.7, 1.3))
+
+        oc_data = request_with_retry(
+            session,
+            f"{BASE_URL}/api/option-chain-indices?symbol=NIFTY",
+            timeout=15,
+        )
+    except Exception as exc:
+        print(f"[Error] NSE fetch failed: {exc}")
+        if existing is not None:
+            existing["fetch_status"] = f"fallback_cached ({exc})"
+            with open("nse_data.json", "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2)
+            print("[Info] Preserved existing nse_data.json without failing workflow.")
+            return
+        raise
 
     nse_adv, nse_dec = extract_overall_nse_breadth(session, all_ind)
 
@@ -349,7 +374,7 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
     oil_item = indices_by_name.get("NIFTY OIL & GAS") or {}
     it_item = indices_by_name.get("NIFTY IT") or {}
 
-    oc_underlying = (oc_data.get("records") or {}).get("underlyingValue")
+    oc_underlying = ((oc_data or {}).get("records") or {}).get("underlyingValue")
 
     high_val = nifty_50_item.get("high") or nifty_meta.get("high")
     low_val = nifty_50_item.get("low") or nifty_meta.get("low")
@@ -362,12 +387,12 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
     if nifty_dec is None:
         nifty_dec = to_int_or_none(nifty_50_item.get("declines"))
 
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
     oc_analysis = analyze_option_chain(oc_data, ltp_val, now_ist.date(), primary_expiry=primary_expiry)
     primary = oc_analysis["primary"]
 
     payload = {
         "updated_at": now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "fetch_status": "ok",
         "expiry_scope": primary_expiry,
         "weekly_expiry": oc_analysis["weekly"]["expiry"],
         "monthly_expiry": oc_analysis["monthly"]["expiry"],
@@ -381,7 +406,7 @@ def fetch_nse_snapshot(primary_expiry="weekly"):
         "opt_vol": primary["opt_vol"],
         "opt_oi": primary["opt_oi"],
         "atm_both_flag": primary["atm_both_flag"],
-        "atm_chart": "",
+        "atm_chart": (existing or {}).get("atm_chart", ""),
         "high": high_val,
         "low": low_val,
         "ltp": ltp_val,
