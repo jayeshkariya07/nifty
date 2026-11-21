@@ -44,3 +44,8 @@ jobs:
             git pull --rebase --autostash origin HEAD
             git push
           fi
+
+      - name: Install Python dependencies and Playwright Chromium
+        run: |
+          pip install playwright
+          playwright install chromium
